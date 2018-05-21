@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
-from multiprocessing import Process, Queue, Lock
-import math
+from multiprocessing import Process, Manager
 
 
 def read(path):
@@ -61,7 +60,7 @@ def createtempvec(vectors, grey):
     return tempvec
 
 
-def comb(vectors, length, bytelen, num, threadquantity, queue, lock):
+def comb(vectors, length, bytelen, num, threadquantity, wlists):
     """
     Генерирует набор векторов, считает их веса и записывает в список весов.
 
@@ -71,8 +70,7 @@ def comb(vectors, length, bytelen, num, threadquantity, queue, lock):
     bytelen -- длина базисного вектора.
     num -- номер потока.
     threadquantity -- общее количество потоков.
-    queue -- очередь для записи списка весов. 
-    lock -- блокировка. Необходима для синхноризации очереди.
+    wlists -- контейнер для записи списка весов
     """
 
     # создание пустого вектора весов
@@ -88,18 +86,15 @@ def comb(vectors, length, bytelen, num, threadquantity, queue, lock):
     # заполнение веса для начального вектора
     position = bin(tempvec).count('1')
     wlist[position] += 1
-
     # цикл генерации векторов и подсчета весов
     old_g, new_g = grey(left), grey(left + 1)
     for i in range(left + 1, right):
-        tempvec ^= vectors[int(math.log2(abs(old_g - new_g)))]
+        ind = bin(old_g - new_g)[::-1].find('1')
+        tempvec ^= vectors[ind]
         position = bin(tempvec).count('1')
         wlist[position] += 1
         old_g, new_g = new_g, grey(i+1)
-
-    # блокировка перед отправкой результатов в очередь
-    lock.acquire()
-    queue.put(wlist)
+    wlists.append(wlist)
     # конец работы потока
 
 
@@ -156,6 +151,97 @@ def getpath(readflag = 0):
             return -2
     return path
 
+def getind(temp, bytelen):
+    """
+    Вычисление индексов нулевых столбцов.
+    
+    Arguments:
+    temp -- дизъюнкция векторов.
+    bytelen -- длина векторов.
+
+    Return:
+    zeros -- список, состоящий из индексов нулевых столбцов.
+    """
+    zeros = []
+    tempstr = bin(temp)[2:]
+    templen = len(tempstr)
+    # если все вектора начинаются с нулей
+    if templen < bytelen:
+        zeros = [bytelen-1 - i for i in range(bytelen-templen)]
+    # вычисление индексов нулевых строк
+    for i in range(templen):
+        if tempstr[i] == '0':
+            zeros.append(templen-1-i)
+    return zeros
+
+def deletezeros(vec, setlength, bytelen):
+    """
+    Удаление всех нулевых столбцов
+
+    Arguments:
+    vec -- вектора
+    setlength -- количество векторов
+    bytelen -- длина вектора
+
+    Return:
+    vec -- вектора
+    bytelen -- измененная длина вектора
+    """
+    temp = 0
+    for v in vec:
+        temp |= v
+    zeros = getind(temp, bytelen)
+    for z in zeros:
+        for i in range(setlength):
+            vec[i] = (vec[i] % (2**z)) + (vec[i] // (2**(z+1)) ) * 2**z
+        bytelen -= 1
+    return (vec, bytelen)
+
+def getoptbas(vec, setlength, bytelen):
+    """
+    Вычисление оптимального базиса
+
+    Arguments:
+    vec -- вектора
+    setlength -- количество векторов
+    bytelen -- длина вектора
+    
+    Return:
+    basis -- набор базисных векторов
+    rank -- ранг матрицы из базисных векторов
+
+    """
+    rank = 0
+    if setlength > bytelen:
+        rank = bytelen
+    else:
+        rank = setlength
+    r = 0
+    while r < rank:
+        # нахождение наибольшего вектора
+        indmaxv = r
+        for i in range(r, setlength):
+            if vec[i] > vec[indmaxv]:
+                indmaxv = i
+        vec[indmaxv], vec[r] = vec[r], vec[indmaxv]
+        # если на главной диагонали 1, то xor-им все вектора, где на этой позиции тоже 1
+        if (vec[r] & 2**(bytelen - 1 - r)):
+            for i in range(setlength):
+                if (vec[i] & 2**(bytelen - 1 - r)):
+                    if i != r:
+                        vec[i] ^= vec[r]
+        r += 1
+
+    basis = []
+    # удаление нулевых векторов из базиса
+    for r in range(rank):
+        if vec[r] != 0:
+            basis.append(vec[r])
+        else:
+            rank -= 1
+    return (basis, rank)
+
+
 
 def main():
     """
@@ -176,29 +262,35 @@ def main():
                     break
             if fromread == -2:
                 break
-            vec, setlength, bytelen = fromread[0], fromread[1], fromread[2]
-
-            # создание потоков для выполнения задачи
             print("File {} is found. Start processing.".format(os.path.split(path)[1]))
-            threadquantity = int(2**2)
-            queue = Queue()
-            lock = Lock()
-            threads = [Process(target=comb, args=(vec, setlength, bytelen, num, threadquantity, queue, lock)) for num in range(threadquantity)]
-            
-            # запуск потоков для выполнения задачи
-            for t in threads:
-                t.start()
-            
-            # подсчёт итогового списка весов
-            wlist = queue.get()
-            lock.release()
-            for i in range(len(threads) - 1):
-                temp = queue.get()
-                lock.release()
-                wlist = [wlist[i] + temp[i] for i in range(len(wlist))]
-            for t in threads:
-                t.join()
-            
+            # удаление нулевых столбцов
+            vec, bytelen = deletezeros(fromread[0], fromread[1], fromread[2])
+            setlength = fromread[1]
+            # приведение к оптимальному базису
+            vec, rank = getoptbas(vec, setlength, bytelen)
+            wlist = []
+            # если случай тривиальный, то вычисляем гистограмму сразу
+            if rank == bytelen:
+                wlist = [1*2**(setlength-rank)]
+                for i in range(1, rank+1):
+                    wlist.append(wlist[i-1]*(rank-i+1)/i)
+                wlist = [int(w) for w in wlist]
+
+            else:
+                # создание потоков для выполнения задачи
+                # количество потоков может быть не только степенью числа 2
+                threadquantity = 12
+                wlists = Manager().list()
+                threads = [Process(target=comb, args=(vec, rank, bytelen, num, threadquantity, wlists)) for num in range(threadquantity)]
+                # запуск потоков для выполнения задачи
+                for t in threads:
+                    t.start()
+                
+                for t in threads:
+                    t.join()
+                wlist = [0]*len(wlists[0])
+                for w in wlists:
+                    wlist = [wlist[i] + w[i] for i in range(len(w))]
             # создание файла с гистограммой
             gist(path, wlist)
             print("Success")
